@@ -396,7 +396,7 @@
 			</div>
 		</div>
 		<div class="mt-3 flex flex-wrap items-center gap-2">
-			<button class="btn btn-sm" disabled={readOnly || busy || false} onclick={writeFeedConfig}
+			<button class="btn btn-sm" disabled={readOnly || busy || true} onclick={writeFeedConfig}
 				>Write to config again</button
 			>
 			<span class="text-[12.5px] text-mist-600"
