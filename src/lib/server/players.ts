@@ -16,7 +16,8 @@ import {
 import { orgListMembership } from './lists';
 import { kills, playerMarks, playerNotes, playerSessions, serverBans, servers } from './db/schema';
 import { getProfiles, isSteamId, steamEnabled, type SteamProfileRow } from './steam';
-import { accountAgeDays, assessRisk, namesResemble, type Risk } from './risk';
+import { accountAgeDays, assessRisk, namesResemble, type Risk, type RiskPerformance } from './risk';
+import { riskPerformanceFor } from './leaderboards';
 import type {
 	DossierView,
 	PlayerCombat,
@@ -46,6 +47,10 @@ export function steamView(row: SteamProfileRow | undefined | null): SteamView | 
 		daysSinceLastBan: row.daysSinceLastBan,
 		communityBanned: row.communityBanned,
 		economyBan: row.economyBan,
+		friendsState: row.friendsState,
+		friendsTotal: row.friendsTotal,
+		friendsChecked: row.friendsChecked,
+		bannedFriends: row.bannedFriends,
 		fetchedAt: row.fetchedAt.toISOString(),
 		error: row.error
 	};
@@ -164,6 +169,8 @@ export function riskFor(
 	env: Env,
 	profile: SteamProfileRow | undefined,
 	local: LocalSignals | undefined,
+	/** recorded games on the servers the reader can open, never the whole org's */
+	performance: RiskPerformance | undefined,
 	/** false leaves the watchlist reason out of the risk line: it is a staff note */
 	staff = true
 ): Risk {
@@ -172,7 +179,8 @@ export function riskFor(
 		steamEnabled: steamEnabled(env),
 		watched: local?.watched ? { reason: staff ? local.watched.reason : '' } : null,
 		bannedOn: local?.bannedOn ?? [],
-		resembles: local?.resembles ?? []
+		resembles: local?.resembles ?? [],
+		performance: performance ?? null
 	});
 }
 
@@ -189,14 +197,15 @@ export async function marksFor(
 	// Bans elsewhere in the org count only where the reader could open them, as in the dossier.
 	const orgIds = (await accessibleServers(env, user, server.orgId)).map((s) => s.id);
 	const staff = access.caps.has('players.notes') || access.caps.has('players.notes.manage');
-	const [profiles, local, counts] = await Promise.all([
+	const [profiles, local, counts, performance] = await Promise.all([
 		getProfiles(env, ids),
 		localSignals(env, server.orgId, orgIds, server.id, players),
 		env.db
 			.select({ steamId: playerSessions.steamId, n: sql<number>`count(*)` })
 			.from(playerSessions)
 			.where(and(eq(playerSessions.serverId, server.id), inArray(playerSessions.steamId, ids)))
-			.groupBy(playerSessions.steamId)
+			.groupBy(playerSessions.steamId),
+		riskPerformanceFor(env, orgIds, ids)
 	]);
 	const visits = new Map(counts.map((c) => [c.steamId, num(c.n)]));
 	return ids.map((steamId) => {
@@ -206,7 +215,7 @@ export async function marksFor(
 			watched: !!l?.watched,
 			reason: staff ? (l?.watched?.reason ?? '') : '',
 			firstVisit: (visits.get(steamId) ?? 0) <= 1,
-			risk: riskFor(env, profiles.get(steamId), l, staff)
+			risk: riskFor(env, profiles.get(steamId), l, performance.get(steamId), staff)
 		};
 	});
 }
@@ -229,14 +238,11 @@ export async function dossier(
 	const [summary] = await db.execute<{
 		sessions: string;
 		minutes: string | null;
-		kills: string | null;
-		deaths: string | null;
 		firstSeen: Date | null;
 		lastSeen: Date | null;
 	}>(sql`
 		SELECT COUNT(*) AS sessions,
 		       SUM(EXTRACT(EPOCH FROM (COALESCE(left_at, now()) - joined_at))) / 60 AS minutes,
-		       SUM(kills) AS kills, SUM(deaths) AS deaths,
 		       MIN(joined_at) AS "firstSeen", MAX(last_seen) AS "lastSeen"
 		  FROM player_sessions WHERE steam_id = ${steamId} AND server_id IN ${ids.length ? ids : ['']}`);
 	const perServer = ids.length
@@ -244,16 +250,29 @@ export async function dossier(
 				serverId: string;
 				sessions: string;
 				minutes: string;
-				kills: string;
-				deaths: string;
 				lastSeen: Date;
 			}>(sql`
 			SELECT server_id AS "serverId", COUNT(*) AS sessions,
 			       SUM(EXTRACT(EPOCH FROM (COALESCE(left_at, now()) - joined_at))) / 60 AS minutes,
-			       SUM(kills) AS kills, SUM(deaths) AS deaths, MAX(last_seen) AS "lastSeen"
+			       MAX(last_seen) AS "lastSeen"
 			  FROM player_sessions WHERE steam_id = ${steamId} AND server_id IN ${ids}
 			 GROUP BY server_id ORDER BY "lastSeen" DESC`)
 		: [];
+	// Kills and deaths are the game's own counters, summed from the player's lines of the matches
+	// that ended (the same rows the boards and careers read, so every page agrees).
+	const recorded = ids.length
+		? await db.execute<{ serverId: string; kills: string; deaths: string }>(sql`
+			SELECT p.server_id AS "serverId", SUM(p.kills) AS kills, SUM(p.deaths) AS deaths
+			  FROM match_players p JOIN matches m ON m.id = p.match_id
+			 WHERE p.steam_id = ${steamId} AND p.server_id IN ${ids} AND m.ended_at IS NOT NULL
+			 GROUP BY p.server_id`)
+		: [];
+	const recordedOn = new Map(recorded.map((r) => [r.serverId, r]));
+	const recordedAll = { kills: 0, deaths: 0 };
+	for (const r of recorded) {
+		recordedAll.kills += num(r.kills);
+		recordedAll.deaths += num(r.deaths);
+	}
 	const recent = ids.length
 		? await db
 				.select()
@@ -270,34 +289,48 @@ export async function dossier(
 	const online = recent.find((s) => s.leftAt === null) ?? null;
 	const name = names[0]?.name || steamId;
 
-	const [profiles, local, [mark], noteRows, actions, org, listsRole, allOrgServers, combat] =
-		await Promise.all([
-			getProfiles(env, [steamId], { refresh: !!opts.refreshSteam }),
-			localSignals(env, server.orgId, ids, null, [{ steamId, name }]),
-			db
-				.select()
-				.from(playerMarks)
-				.where(and(eq(playerMarks.orgId, server.orgId), eq(playerMarks.steamId, steamId)))
-				.limit(1),
-			db
-				.select()
-				.from(playerNotes)
-				.where(and(eq(playerNotes.orgId, server.orgId), eq(playerNotes.steamId, steamId)))
-				.orderBy(desc(playerNotes.id))
-				.limit(100),
-			auditVisibility(env, user).then((visibleTo) =>
-				queryAudit(env, {
-					target: steamId,
-					scope: { orgId: server.orgId, serverIds: ids },
-					visibleTo,
-					limit: 50
-				})
-			),
-			getOrg(env, server.orgId),
-			listsRoleFor(env, user, server.orgId),
-			orgServers(env, server.orgId),
-			playerCombat(env, ids, nameOf, steamId)
-		]);
+	const [
+		profiles,
+		local,
+		[mark],
+		noteRows,
+		actions,
+		org,
+		listsRole,
+		allOrgServers,
+		combat,
+		performance
+	] = await Promise.all([
+		getProfiles(env, [steamId], {
+			refresh: !!opts.refreshSteam,
+			awaitFriends: !!opts.refreshSteam
+		}),
+		localSignals(env, server.orgId, ids, null, [{ steamId, name }]),
+		db
+			.select()
+			.from(playerMarks)
+			.where(and(eq(playerMarks.orgId, server.orgId), eq(playerMarks.steamId, steamId)))
+			.limit(1),
+		db
+			.select()
+			.from(playerNotes)
+			.where(and(eq(playerNotes.orgId, server.orgId), eq(playerNotes.steamId, steamId)))
+			.orderBy(desc(playerNotes.id))
+			.limit(100),
+		auditVisibility(env, user).then((visibleTo) =>
+			queryAudit(env, {
+				target: steamId,
+				scope: { orgId: server.orgId, serverIds: ids },
+				visibleTo,
+				limit: 50
+			})
+		),
+		getOrg(env, server.orgId),
+		listsRoleFor(env, user, server.orgId),
+		orgServers(env, server.orgId),
+		playerCombat(env, ids, nameOf, steamId),
+		riskPerformanceFor(env, ids, [steamId])
+	]);
 	const l = local.get(steamId);
 	const admin = access.caps.has('players.notes.manage');
 	// What staff wrote about the player is for those who may write it; the org list entry (its
@@ -316,7 +349,7 @@ export async function dossier(
 		orgLists: { ...membership, canEdit: listsRole !== null },
 		steamEnabled: steamEnabled(env),
 		steam: steamView(profiles.get(steamId)),
-		risk: riskFor(env, profiles.get(steamId), l, staff),
+		risk: riskFor(env, profiles.get(steamId), l, performance.get(steamId), staff),
 		watch: {
 			watched: !!mark?.watched,
 			reason: staff ? (mark?.reason ?? '') : '',
@@ -333,8 +366,8 @@ export async function dossier(
 		summary: {
 			sessions: num(summary?.sessions),
 			minutes: Math.round(num(summary?.minutes)),
-			kills: num(summary?.kills),
-			deaths: num(summary?.deaths),
+			kills: recordedAll.kills,
+			deaths: recordedAll.deaths,
 			firstSeen: iso(summary?.firstSeen ? new Date(summary.firstSeen) : null),
 			lastSeen: iso(summary?.lastSeen ? new Date(summary.lastSeen) : null)
 		},
@@ -343,8 +376,8 @@ export async function dossier(
 			serverName: nameOf.get(r.serverId) || r.serverId,
 			sessions: num(r.sessions),
 			minutes: Math.round(num(r.minutes)),
-			kills: num(r.kills),
-			deaths: num(r.deaths),
+			kills: num(recordedOn.get(r.serverId)?.kills),
+			deaths: num(recordedOn.get(r.serverId)?.deaths),
 			lastSeen: new Date(r.lastSeen).toISOString()
 		})),
 		recent: recent.map((s) => ({

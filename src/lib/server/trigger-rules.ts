@@ -2,7 +2,7 @@
 // kick-on-connect verdict. No database, no game server, so it is unit-testable on its own;
 // triggers.ts holds the engine that runs these against live ticks.
 import { ApiError, int, str } from './http';
-import { accountAgeDays, assessRisk, type RiskLevel } from './risk';
+import { accountAgeDays, assessRisk, type RiskLevel, type RiskPerformance } from './risk';
 import { validateNameFilter, type NameFilterConfig } from './name-filter';
 import { RESTART_AFTER_HOURS, restartWindow } from '$lib/uptime';
 import type { SteamProfileRow } from './db/schema';
@@ -14,6 +14,7 @@ export const TRIGGER_KINDS: TriggerKind[] = [
 	'broadcast',
 	'empty_reset',
 	'risk_kick',
+	'ping_kick',
 	'restart_notice',
 	'team_kill',
 	'seed_reward',
@@ -26,6 +27,7 @@ export const TRIGGER_LABELS: Record<TriggerKind, string> = {
 	broadcast: 'Scheduled broadcast',
 	empty_reset: 'Empty-server map reset',
 	risk_kick: 'Kick on connect risk',
+	ping_kick: 'High ping kick',
 	restart_notice: 'Restart notice',
 	team_kill: 'Team kill limit',
 	seed_reward: 'Seeding reward',
@@ -62,6 +64,8 @@ export interface EmptyResetConfig {
 export interface RiskKickConfig {
 	vacBans: boolean;
 	gameBans: boolean;
+	/** only consider bans this recent; 0 means any ban on record */
+	maxBanAgeDays: number;
 	minAccountDays: number;
 	privateProfiles: boolean;
 	bannedElsewhere: boolean;
@@ -71,9 +75,49 @@ export interface RiskKickConfig {
 	spareReserved: boolean;
 	reason: string;
 }
+export interface PingKickConfig {
+	maxPingMs: number;
+	durationSeconds: number;
+	reason: string;
+}
+
+export interface PingKickState {
+	lastAt: number;
+	players: Record<string, { since: number; fired: boolean }>;
+}
+
+/** Advance one fresh player-list sample. Missing/normal pings end a streak. */
+export function pingKickStep(
+	cfg: PingKickConfig,
+	previous: PingKickState | null,
+	players: { steamId: string; ping: number | null }[],
+	now: number,
+	maxGapMs: number
+): { state: PingKickState; kicks: string[] } {
+	const old: PingKickState['players'] =
+		previous &&
+		Number.isFinite(previous.lastAt) &&
+		now >= previous.lastAt &&
+		now - previous.lastAt <= maxGapMs &&
+		previous.players
+			? previous.players
+			: {};
+	const next: PingKickState = { lastAt: now, players: {} };
+	const kicks: string[] = [];
+	for (const p of players) {
+		if (p.ping === null || !Number.isFinite(p.ping) || p.ping <= cfg.maxPingMs) continue;
+		const streak = old[p.steamId] ? { ...old[p.steamId] } : { since: now, fired: false };
+		if (!streak.fired && now - streak.since >= cfg.durationSeconds * 1000) {
+			streak.fired = true;
+			kicks.push(p.steamId);
+		}
+		next.players[p.steamId] = streak;
+	}
+	return { state: next, kicks };
+}
 /**
  * Tells players about the game's own restart: WARDOGS restarts a server once it has been up for
- * twelve hours, at the end of the round then in progress. Two broadcasts per uptime cycle: a
+ * 24 hours, at the end of the round then in progress. Two broadcasts per uptime cycle: a
  * heads-up `leadMinutes` before the window opens (0 = none) and `message` once it has, repeated
  * every `repeatMinutes` while the round drags on (0 = once).
  */
@@ -132,6 +176,7 @@ export type TriggerConfig =
 	| BroadcastConfig
 	| EmptyResetConfig
 	| RiskKickConfig
+	| PingKickConfig
 	| RestartNoticeConfig
 	| TeamKillConfig
 	| SeedRewardConfig
@@ -199,6 +244,7 @@ export function validateConfig(kind: TriggerKind, raw: unknown): TriggerConfig {
 			const cfg: RiskKickConfig = {
 				vacBans: !!c.vacBans,
 				gameBans: !!c.gameBans,
+				maxBanAgeDays: int(c.maxBanAgeDays, 0, 0, 36500),
 				minAccountDays: int(c.minAccountDays, 0, 0, 3650),
 				privateProfiles: !!c.privateProfiles,
 				bannedElsewhere: !!c.bannedElsewhere,
@@ -218,6 +264,17 @@ export function validateConfig(kind: TriggerKind, raw: unknown): TriggerConfig {
 			)
 				throw new ApiError(400, 'Turn on at least one rule.');
 			return cfg;
+		}
+		case 'ping_kick': {
+			const maxPingMs = int(c.maxPingMs, 200, 0, 2000);
+			const durationSeconds = int(c.durationSeconds, 60, 0, 3600);
+			if (!maxPingMs) throw new ApiError(400, 'Set a ping limit from 1 to 2000 ms.');
+			if (!durationSeconds) throw new ApiError(400, 'Set a duration from 1 to 3600 seconds.');
+			return {
+				maxPingMs,
+				durationSeconds,
+				reason: str(c.reason, MAX_MESSAGE) || 'Ping too high for too long.'
+			};
 		}
 		case 'restart_notice': {
 			const message = str(c.message, MAX_MESSAGE);
@@ -529,14 +586,37 @@ export function matchBoundary(prev: MatchLook | null, next: MatchLook): MatchEnd
 	};
 }
 
-/** The placeholders a match boundary fills: the result of the match that ended. */
-export function matchVars(end: MatchEnd): Record<string, string | number> {
+/** A player's line of the match that ended, as far as the placeholders need it. */
+export interface MatchLineVars {
+	name: string;
+	kills: number;
+}
+
+/**
+ * The placeholders a match boundary fills: the result of the match that ended, and from the
+ * players' lines of it, `{mvp}` (the most kills, tied players named together) and `{top}` (the
+ * top three with their kills). Both are empty when nobody killed anyone.
+ */
+export function matchVars(
+	end: MatchEnd,
+	lines: MatchLineVars[] = []
+): Record<string, string | number> {
 	const top = end.scores[0]?.score ?? 0;
+	const ranked = lines.filter((l) => l.kills > 0).sort((a, b) => b.kills - a.kills);
+	const best = ranked[0]?.kills ?? 0;
 	return {
 		faction: end.leaders.join(' and '),
 		score: top,
 		scores: end.scores.map((f) => `${f.name} ${f.score}`).join(' · '),
-		previous: end.map
+		previous: end.map,
+		mvp: ranked
+			.filter((l) => l.kills === best)
+			.map((l) => l.name)
+			.join(' and '),
+		top: ranked
+			.slice(0, 3)
+			.map((l) => `${l.name} ${l.kills}`)
+			.join(' · ')
 	};
 }
 
@@ -548,10 +628,11 @@ export function matchBroadcastMessages(
 	cfg: MatchBroadcastConfig,
 	end: MatchEnd,
 	playerCount: number,
-	vars: Record<string, string | number>
+	vars: Record<string, string | number>,
+	lines: MatchLineVars[] = []
 ): { stage: 'end' | 'start'; message: string }[] {
 	if (playerCount < cfg.minPlayers) return [];
-	const all = { ...vars, ...matchVars(end) };
+	const all = { ...vars, ...matchVars(end, lines) };
 	const out: { stage: 'end' | 'start'; message: string }[] = [];
 	if (cfg.endMessage && end.leaders.length)
 		out.push({ stage: 'end', message: renderTemplate(cfg.endMessage, all) });
@@ -616,7 +697,7 @@ export function welcomeTargets<P extends { steamId: string }>(
 export const factionChangeTargets = <P>(tick: { factioned: FactionPick<P>[] }): FactionPick<P>[] =>
 	tick.factioned.filter((f) => !!f.from);
 
-/** Fills {name}, {faction}, {previous}, {server}, {map}, {players} and {max}; unknown ones stay. */
+/** Fills {name}, {faction}, {previous}, {server}, {map}, {players}, {max} and the rest; unknown ones stay. */
 export function renderTemplate(text: string, vars: Record<string, string | number>): string {
 	const lower: Record<string, string> = {};
 	for (const [k, v] of Object.entries(vars)) lower[k.toLowerCase()] = String(v);
@@ -633,6 +714,7 @@ export interface RiskKickSignals {
 	/** banned players whose last known name looks like this one; only the risk level uses it */
 	resembles?: { name: string; steamId: string; serverName: string }[];
 	reserved: boolean;
+	performance?: RiskPerformance | null;
 	now?: Date;
 }
 
@@ -645,9 +727,14 @@ export function riskKickVerdict(cfg: RiskKickConfig, s: RiskKickSignals): string
 		return `on the watchlist${s.watched.reason ? ` (${s.watched.reason})` : ''}`;
 	if (s.steamEnabled && s.profile && !s.profile.error) {
 		const p = s.profile;
-		if (cfg.vacBans && p.vacBans > 0)
+		// Configs saved before this setting existed have no property; they keep the old
+		// behaviour of considering the player's full ban history.
+		const maxBanAgeDays = cfg.maxBanAgeDays ?? 0;
+		const banIsRecentEnough =
+			maxBanAgeDays === 0 || p.daysSinceLastBan === null || p.daysSinceLastBan <= maxBanAgeDays;
+		if (cfg.vacBans && p.vacBans > 0 && banIsRecentEnough)
 			return `${p.vacBans} VAC ban${p.vacBans === 1 ? '' : 's'} on record`;
-		if (cfg.gameBans && p.gameBans > 0)
+		if (cfg.gameBans && p.gameBans > 0 && banIsRecentEnough)
 			return `${p.gameBans} game ban${p.gameBans === 1 ? '' : 's'} on record`;
 		if (cfg.minAccountDays > 0) {
 			const age = accountAgeDays(p.accountCreatedAt, s.now);
@@ -665,6 +752,7 @@ export function riskKickVerdict(cfg: RiskKickConfig, s: RiskKickSignals): string
 			watched: s.watched,
 			bannedOn: s.bannedOn,
 			resembles: s.resembles ?? [],
+			performance: s.performance,
 			now: s.now
 		});
 		const bad = risk.level === 'high' || (cfg.kickAtLevel === 'medium' && risk.level === 'medium');

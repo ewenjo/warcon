@@ -10,6 +10,7 @@ import {
 	matchBoundary,
 	matchBroadcastMessages,
 	matchReplay,
+	pingKickStep,
 	riskKickVerdict,
 	seedRule,
 	seedReplay,
@@ -87,18 +88,32 @@ describe('validateConfig', () => {
 		// the heads-up cannot be earlier than the game start
 		expect(
 			validateConfig('restart_notice', { message: 'bye', leadMinutes: 5000, leadMessage: 'soon' })
-		).toMatchObject({ leadMinutes: 719 });
+		).toMatchObject({ leadMinutes: 1439 });
 	});
 	test('risk_kick refuses an empty rule set and defaults the reason', () => {
 		expect(() => validateConfig('risk_kick', {})).toThrow('at least one rule');
 		const c = validateConfig('risk_kick', { vacBans: true }) as RiskKickConfig;
 		expect(c.spareReserved).toBe(true);
+		expect(c.maxBanAgeDays).toBe(0);
 		expect(c.kickAtLevel).toBeNull();
 		expect(c.reason).toContain('requirements');
 		expect(validateConfig('risk_kick', { kickAtLevel: 'medium' })).toMatchObject({
 			kickAtLevel: 'medium'
 		});
 		expect(() => validateConfig('risk_kick', { kickAtLevel: 'low' })).toThrow('at least one rule');
+	});
+	test('ping_kick validates the ping and duration and supplies a reason', () => {
+		expect(validateConfig('ping_kick', {})).toEqual({
+			maxPingMs: 200,
+			durationSeconds: 60,
+			reason: 'Ping too high for too long.'
+		});
+		expect(() => validateConfig('ping_kick', { maxPingMs: 0 })).toThrow('ping limit');
+		expect(() => validateConfig('ping_kick', { durationSeconds: 0 })).toThrow('duration');
+		expect(validateConfig('ping_kick', { maxPingMs: 250, durationSeconds: 30 })).toMatchObject({
+			maxPingMs: 250,
+			durationSeconds: 30
+		});
 	});
 	test('seed_reward needs a seed time that fits its window, and fills in the rest', () => {
 		expect(() => validateConfig('seed_reward', {})).toThrow('minutes');
@@ -151,6 +166,38 @@ describe('validateConfig', () => {
 		expect(validateConfig('seed_reward', { minutes: 60, scope: 'everywhere' })).toMatchObject({
 			scope: 'org'
 		});
+	});
+});
+
+describe('pingKickStep', () => {
+	const cfg = { maxPingMs: 200, durationSeconds: 30, reason: 'High ping' };
+	const high = [{ steamId: 'a', ping: 250 }];
+	const step = (state: Parameters<typeof pingKickStep>[1], players: typeof high, now: number) =>
+		pingKickStep(cfg, state, players, now, 5000);
+	test('fires only after a continuous high-ping duration, and only once per streak', () => {
+		const first = step(null, high, 1000);
+		expect(first.kicks).toEqual([]);
+		const early = step(first.state, high, 29_000);
+		// A gap in player sampling restarts the timer.
+		expect(early.kicks).toEqual([]);
+		expect(early.state.players.a.since).toBe(29_000);
+		let state = step(null, high, 0).state;
+		for (const at of [5000, 10_000, 15_000, 20_000, 25_000]) state = step(state, high, at).state;
+		const due = step(state, high, 30_000);
+		expect(due.kicks).toEqual(['a']);
+		expect(step(due.state, high, 35_000).kicks).toEqual([]);
+		const recovered = step(due.state, [{ steamId: 'a', ping: 100 }], 35_000);
+		let again = step(recovered.state, high, 40_000).state;
+		for (const at of [45_000, 50_000, 55_000, 60_000, 65_000]) again = step(again, high, at).state;
+		expect(step(again, high, 70_000).kicks).toEqual(['a']);
+	});
+	test('normal or missing ping and leaving reset the streak', () => {
+		const first = step(null, high, 0);
+		for (const players of [[{ steamId: 'a', ping: 200 }], [{ steamId: 'a', ping: null }], []]) {
+			const reset = pingKickStep(cfg, first.state, players, 1000, 5000);
+			expect(reset.state.players.a).toBeUndefined();
+			expect(step(reset.state, high, 2000).state.players.a.since).toBe(2000);
+		}
 	});
 });
 
@@ -350,6 +397,7 @@ describe('riskKickVerdict', () => {
 	const cfg: RiskKickConfig = {
 		vacBans: true,
 		gameBans: false,
+		maxBanAgeDays: 0,
 		minAccountDays: 30,
 		privateProfiles: false,
 		bannedElsewhere: true,
@@ -371,6 +419,11 @@ describe('riskKickVerdict', () => {
 		daysSinceLastBan: null,
 		communityBanned: false,
 		economyBan: 'none',
+		friendsState: 'unknown',
+		friendsTotal: 0,
+		friendsChecked: 0,
+		bannedFriends: 0,
+		friendsCheckedAt: null,
 		fetchedAt: now,
 		error: ''
 	};
@@ -401,6 +454,50 @@ describe('riskKickVerdict', () => {
 				profile: { ...profile, accountCreatedAt: new Date('2020-01-01') }
 			})
 		).toBeNull();
+	});
+	test('ban age window ignores older VAC and game bans, while 0 means forever', () => {
+		const oldVac = { ...profile, vacBans: 1, daysSinceLastBan: 366 };
+		expect(
+			riskKickVerdict(
+				{ ...cfg, maxBanAgeDays: 365, minAccountDays: 0 },
+				{ ...base, profile: oldVac }
+			)
+		).toBeNull();
+		expect(
+			riskKickVerdict(
+				{ ...cfg, maxBanAgeDays: 366, minAccountDays: 0 },
+				{ ...base, profile: oldVac }
+			)
+		).toBe('1 VAC ban on record');
+		expect(
+			riskKickVerdict({ ...cfg, maxBanAgeDays: 0, minAccountDays: 0 }, { ...base, profile: oldVac })
+		).toBe('1 VAC ban on record');
+
+		const oldGame = { ...profile, gameBans: 2, daysSinceLastBan: 500 };
+		expect(
+			riskKickVerdict(
+				{ ...cfg, vacBans: false, gameBans: true, maxBanAgeDays: 30, minAccountDays: 0 },
+				{ ...base, profile: oldGame }
+			)
+		).toBeNull();
+	});
+	test('a ban with unknown age is still enforced when an age window is set', () => {
+		expect(
+			riskKickVerdict(
+				{ ...cfg, maxBanAgeDays: 30, minAccountDays: 0 },
+				{ ...base, profile: { ...profile, vacBans: 1, daysSinceLastBan: null } }
+			)
+		).toBe('1 VAC ban on record');
+	});
+	test('a rule saved before the ban age field existed still considers all bans', () => {
+		const legacy = { ...cfg } as Partial<RiskKickConfig>;
+		delete legacy.maxBanAgeDays;
+		expect(
+			riskKickVerdict(legacy as RiskKickConfig, {
+				...base,
+				profile: { ...profile, vacBans: 1, daysSinceLastBan: 5000 }
+			})
+		).toBe('1 VAC ban on record');
 	});
 	test('private profiles pass unless asked to fail', () => {
 		const priv = { ...profile, public: false, accountCreatedAt: null };
@@ -442,6 +539,29 @@ describe('riskKickVerdict', () => {
 				{ ...base, profile: { ...profile, vacBans: 1 } }
 			)
 		).toBe('1 VAC ban on record');
+	});
+	test('recorded games count towards the risk-level rule', () => {
+		const levelOnly = {
+			...cfg,
+			vacBans: false,
+			minAccountDays: 0,
+			bannedElsewhere: false,
+			watchlist: false,
+			kickAtLevel: 'medium' as const
+		};
+		const performance = {
+			matches: 30,
+			wins: 26,
+			losses: 4,
+			draws: 0,
+			kills: 200,
+			deaths: 30,
+			feedKills: 100,
+			headshots: 70
+		};
+		const old = { ...base, profile: { ...profile, accountCreatedAt: new Date('2015-01-01') } };
+		expect(riskKickVerdict(levelOnly, { ...old, performance })).toStartWith('medium risk (28)');
+		expect(riskKickVerdict(levelOnly, old)).toBeNull();
 	});
 	test('the risk level works from local signals alone and says when Steam was not checked', () => {
 		const v = riskKickVerdict(
@@ -497,41 +617,41 @@ describe('restartNoticeStage', () => {
 
 	test('nothing before the heads-up, nothing without a start time or players', () => {
 		expect(restartNoticeStage(cfg, null, at(9))).toBeNull();
-		expect(restartNoticeStage(cfg, null, { ...at(11.9), startedAt: 0 })).toBeNull();
-		expect(restartNoticeStage(cfg, null, at(11.9, 0))).toBeNull();
+		expect(restartNoticeStage(cfg, null, { ...at(23.9), startedAt: 0 })).toBeNull();
+		expect(restartNoticeStage(cfg, null, at(23.9, 0))).toBeNull();
 	});
 	test('the heads-up goes once inside the lead window, then the main message once due', () => {
-		const lead = restartNoticeStage(cfg, null, at(11.6))!;
+		const lead = restartNoticeStage(cfg, null, at(23.6))!;
 		expect(lead.stage).toBe('lead');
 		expect(lead.minutes).toBe(24);
-		expect(lead.state).toEqual({ startedAt: start, leadAt: start + 11.6 * H });
-		expect(restartNoticeStage(cfg, lead.state, at(11.8))).toBeNull();
-		const due = restartNoticeStage(cfg, lead.state, at(12.1))!;
+		expect(lead.state).toEqual({ startedAt: start, leadAt: start + 23.6 * H });
+		expect(restartNoticeStage(cfg, lead.state, at(23.8))).toBeNull();
+		const due = restartNoticeStage(cfg, lead.state, at(24.1))!;
 		expect(due.stage).toBe('due');
 		expect(due.minutes).toBe(0);
-		expect(due.state.dueAt).toBe(start + 12.1 * H);
-		expect(restartNoticeStage(cfg, due.state, at(13))).toBeNull();
+		expect(due.state.dueAt).toBe(start + 24.1 * H);
+		expect(restartNoticeStage(cfg, due.state, at(25))).toBeNull();
 	});
 	test('a missed heads-up is skipped, not sent late, once the window is open', () => {
-		const hit = restartNoticeStage(cfg, null, at(12.5))!;
+		const hit = restartNoticeStage(cfg, null, at(24.5))!;
 		expect(hit.stage).toBe('due');
 		expect(hit.state.leadAt).toBeUndefined();
 	});
 	test('repeat resends the main message on its cadence while the window stays open', () => {
 		const c = { ...cfg, repeatMinutes: 15 };
-		const first = restartNoticeStage(c, null, at(12))!;
-		expect(restartNoticeStage(c, first.state, at(12.2))).toBeNull();
-		const again = restartNoticeStage(c, first.state, at(12.3))!;
+		const first = restartNoticeStage(c, null, at(24))!;
+		expect(restartNoticeStage(c, first.state, at(24.2))).toBeNull();
+		const again = restartNoticeStage(c, first.state, at(24.3))!;
 		expect(again.stage).toBe('due');
-		expect(again.state.dueAt).toBe(start + 12.3 * H);
+		expect(again.state.dueAt).toBe(start + 24.3 * H);
 	});
 	test('a new game start resets the cycle', () => {
-		const old = { startedAt: start - 20 * H, leadAt: 1, dueAt: 2 };
-		expect(restartNoticeStage(cfg, old, at(11.7))!.stage).toBe('lead');
+		const old = { startedAt: start - 40 * H, leadAt: 1, dueAt: 2 };
+		expect(restartNoticeStage(cfg, old, at(23.7))!.stage).toBe('lead');
 	});
 	test('no heads-up when leadMinutes is 0', () => {
-		expect(restartNoticeStage({ ...cfg, leadMinutes: 0 }, null, at(11.9))).toBeNull();
-		expect(restartNoticeStage({ ...cfg, leadMinutes: 0 }, null, at(12))!.stage).toBe('due');
+		expect(restartNoticeStage({ ...cfg, leadMinutes: 0 }, null, at(23.9))).toBeNull();
+		expect(restartNoticeStage({ ...cfg, leadMinutes: 0 }, null, at(24))!.stage).toBe('due');
 	});
 });
 
@@ -650,6 +770,21 @@ describe('matchBroadcastMessages', () => {
 	});
 	test('nothing under the player floor', () => {
 		expect(matchBroadcastMessages(cfg, end, 1, vars)).toEqual([]);
+	});
+	test("{mvp} and {top} come from the players' lines; a tie names both; nobody killing leaves them empty", () => {
+		const c = { ...cfg, endMessage: 'MVP {mvp} · top {top}' };
+		const lines = [
+			{ name: 'Nomad', kills: 20 },
+			{ name: 'Dutchie', kills: 17 },
+			{ name: 'Willowisp', kills: 20 },
+			{ name: 'Brick', kills: 0 }
+		];
+		expect(matchBroadcastMessages(c, end, 40, vars, lines)[0].message).toBe(
+			'MVP Nomad and Willowisp · top Nomad 20 · Willowisp 20 · Dutchie 17'
+		);
+		expect(matchBroadcastMessages(c, end, 40, vars, [{ name: 'Brick', kills: 0 }])[0].message).toBe(
+			'MVP  · top '
+		);
 	});
 });
 
