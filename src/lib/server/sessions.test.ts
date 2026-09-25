@@ -25,7 +25,7 @@ const open = (steamId: string): OpenSession => ({
 	kills: 0,
 	deaths: 0,
 	cash: 0,
-	game: { kills: 0, deaths: 0 },
+	game: { kills: 0, deaths: 0, cash: 0 },
 	seedMs: 0,
 	pendingSeedMs: 0,
 	joinedAt: 1000,
@@ -167,6 +167,65 @@ describe('diffPresence', () => {
 		]);
 	});
 
+	test('a player back inside the grace after missing a look has returned (a kick and a reconnect)', () => {
+		const p = newPresence();
+		for (const id of ['76561198100000001', '76561198100000002']) p.open.set(id, open(id));
+		// the previous look, at 5000, saw only ...002 (followed to 5000); ...001 was kicked at 2000
+		p.open.get('76561198100000002')!.lastSeen = 5000;
+		const d = diffPresence(
+			p,
+			[player('76561198100000001'), player('76561198100000002')],
+			6000,
+			LEAVE_GRACE_MS,
+			5000
+		);
+		expect(d.joined).toHaveLength(0);
+		expect(d.stayed).toHaveLength(2);
+		expect(d.returned.map((x) => x.steamId)).toEqual(['76561198100000001']);
+		// without a previous look nobody counts as returned
+		expect(
+			diffPresence(p, [player('76561198100000001')], 6000, LEAVE_GRACE_MS).returned
+		).toHaveLength(0);
+	});
+
+	test("the game's holding team between matches is no pick of a side, nor a switch", () => {
+		const teams = ['Valkyra', 'Lonestar'];
+		const p = newPresence();
+		p.open.set('76561198100000001', {
+			...open('76561198100000001'),
+			faction: 'Valkyra',
+			lastFaction: 'Valkyra'
+		});
+		const white = diffPresence(
+			p,
+			[{ ...player('76561198100000001'), faction: 'White' }],
+			LATER,
+			LEAVE_GRACE_MS,
+			0,
+			teams
+		);
+		expect(white.factioned).toEqual([]);
+		followPlayer(
+			p.open.get('76561198100000001')!,
+			{ ...player('76561198100000001'), faction: 'White' },
+			LATER,
+			teams
+		);
+		expect(p.open.get('76561198100000001')!.lastFaction).toBe('Valkyra');
+		// the next match: a new side is a switch from the last team, not from White
+		const next = diffPresence(
+			p,
+			[{ ...player('76561198100000001'), faction: 'Lonestar' }],
+			LATER + 1000,
+			LEAVE_GRACE_MS,
+			0,
+			teams
+		);
+		expect(next.factioned.map((x) => [x.player.faction, x.from])).toEqual([
+			['Lonestar', 'Valkyra']
+		]);
+	});
+
 	test('a leave after the grace keeps the last time the player was seen', () => {
 		const p = newPresence();
 		p.open.set('76561198100000001', open('76561198100000001'));
@@ -185,14 +244,14 @@ describe('followPlayer', () => {
 	});
 	const totals = (s: OpenSession) => [s.kills, s.deaths, s.cash];
 
-	test('a session over two matches keeps the first match when the counters start again; cash is the balance', () => {
+	test('a session over two matches keeps the first match when the counters start again, cash included', () => {
 		const s = open('76561198000000001');
 		followPlayer(s, at(37, 7, 90_000), 3000);
-		// the match ends: the game clears the side and the counters, the balance carries
-		followPlayer(s, { ...at(0, 0, 90_000), faction: null }, 4000);
+		// the match ends: the game clears the side, the counters and the cash
+		followPlayer(s, { ...at(0, 0, 0), faction: null }, 4000);
 		expect(totals(s)).toEqual([37, 7, 90_000]);
 		followPlayer(s, at(57, 9, 120_000), 5000);
-		expect(totals(s)).toEqual([94, 16, 120_000]);
+		expect(totals(s)).toEqual([94, 16, 210_000]);
 		expect(s.lastSeen).toBe(5000);
 	});
 
@@ -227,9 +286,9 @@ describe('followPlayer', () => {
 	test('a session reloaded after a restart keeps what earlier matches reached', () => {
 		const s = { ...open('76561198000000001'), kills: 94, deaths: 16, cash: 210_000, game: null };
 		followPlayer(s, at(58, 9, 121_000), 3000);
-		expect(totals(s)).toEqual([94, 16, 121_000]);
+		expect(totals(s)).toEqual([94, 16, 210_000]);
 		followPlayer(s, at(60, 9, 125_000), 4000);
-		expect(totals(s)).toEqual([96, 16, 125_000]);
+		expect(totals(s)).toEqual([96, 16, 214_000]);
 		// a single-match session reloaded simply follows the game
 		const one = { ...open('76561198000000001'), kills: 10, deaths: 2, cash: 5_000, game: null };
 		followPlayer(one, at(12, 2, 6_000), 3000);

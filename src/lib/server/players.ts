@@ -123,7 +123,9 @@ export async function localSignals(
 	orgId: string,
 	orgServerIds: string[],
 	currentServerId: string | null,
-	players: { steamId: string; name: string }[]
+	players: { steamId: string; name: string }[],
+	/** false skips the lookalike names (the costly part: players x banned names), left empty */
+	withResembles = true
 ): Promise<Map<string, LocalSignals>> {
 	const out = new Map<string, LocalSignals>();
 	const ids = [...new Set(players.map((p) => p.steamId).filter(isSteamId))];
@@ -143,7 +145,9 @@ export async function localSignals(
 	]);
 	const watched = new Map(marks.map((m) => [m.steamId, { reason: m.reason }]));
 	const bannedIds = [...new Set(bans.map((b) => b.steamId))];
-	const names = await lastNames(env, orgServerIds, bannedIds.slice(0, 2000));
+	const names = withResembles
+		? await lastNames(env, orgServerIds, bannedIds.slice(0, 2000))
+		: new Map<string, string>();
 	const bannedNamed = bannedIds
 		.map((id) => ({ steamId: id, name: names.get(id) || '' }))
 		.filter((b) => b.name);
@@ -333,11 +337,13 @@ export async function dossier(
 	]);
 	const l = local.get(steamId);
 	const admin = access.caps.has('players.notes.manage');
-	// What staff wrote about the player is for those who may write it; the org list entry (its
-	// reason, who added it, where it stands on every server) for those who may open the lists.
+	// What staff wrote about the player is for those who may write it; an org list entry (its
+	// reason, who added it, where it stands on every server) for those who may edit that list.
 	const staff = admin || access.caps.has('players.notes');
 	const membership =
-		org && listsRole ? await orgListMembership(env, org, steamId) : { ban: null, reserve: null };
+		org && listsRole
+			? await orgListMembership(env, org, steamId, listsRole.kinds)
+			: { ban: null, reserve: null };
 	return {
 		steamId,
 		name,
@@ -346,7 +352,11 @@ export async function dossier(
 			? { serverId: online.serverId, serverName: nameOf.get(online.serverId) || '' }
 			: null,
 		orgServerCount: allOrgServers.length,
-		orgLists: { ...membership, canEdit: listsRole !== null },
+		orgLists: {
+			...membership,
+			canBan: !!listsRole?.kinds.includes('ban'),
+			canReserve: !!listsRole?.kinds.includes('reserve')
+		},
 		steamEnabled: steamEnabled(env),
 		steam: steamView(profiles.get(steamId)),
 		risk: riskFor(env, profiles.get(steamId), l, performance.get(steamId), staff),
